@@ -1,5 +1,10 @@
--- main.lua — legal moves + castling + en passant + promotion UI + piece PNGs
 local S = 80 -- square size
+
+-- ======= AI SETTINGS =======
+local AI_ENABLED   = true      -- set true to play vs AI (AI plays Black)
+local AI_SIDE      = "black"
+local AI_TIME_MS   = 3500   -- time per move in milliseconds (increase for stronger play)
+local AI_MAX_DEPTH = 6         -- safety cap (iterative deepening will stop earlier if time ends)
 
 -- ======= GAME STATE =======
 local board = {}
@@ -489,6 +494,7 @@ function love.load()
   love.window.setMode(S*8, S*8)
   love.window.setTitle("Lua + LÖVE Chess — promotion UI + sprites")
   loadSprites()
+  initZobrist()
   startPosition()
   updateStatus()
 end
@@ -669,3 +675,366 @@ function love.mousepressed(x,y,button)
     end
   end
 end
+
+-- ======= ZOBRIST-LIKE HASH (simple) =======
+local Z = {}
+
+local bit = bit or require("bit")  -- LuaJIT bit operations
+
+local function rand32()
+  -- simple deterministic 32-bit-ish value for hashing
+  local x = love.math.random(0, 0x7fffffff)
+  return bit.bxor(x, bit.lshift(x, 16))
+end
+
+
+function initZobrist()
+  local pieces = {"P","N","B","R","Q","K","p","n","b","r","q","k"}
+  for _,pc in ipairs(pieces) do
+    Z[pc] = {}
+    for sq=1,64 do Z[pc][sq] = rand32() end
+  end
+  Z.turn = rand32()
+end
+
+local function hashBoard(b, sideToMove)
+  local h = 0
+  for r=1,8 do
+    for c=1,8 do
+      local p = b[r][c]
+      if p ~= " " then
+        local sq = (r-1)*8 + c
+        h = bit.bxor(h, Z[p][sq])
+      end
+    end
+  end
+  if sideToMove == "white" then
+    h = bit.bxor(h, Z.turn)
+  end
+  return h
+end
+
+-- ======= EVALUATION =======
+local VAL = { P=100, N=320, B=330, R=500, Q=900, K=0 }
+-- simple piece-square tables (white perspective; black uses mirrored)
+local PST = {
+  P = {
+    { 0,  0,  0,  0,  0,  0,  0,  0},
+    {50, 50, 50, 50, 50, 50, 50, 50},
+    {10, 10, 20, 30, 30, 20, 10, 10},
+    { 5,  5, 10, 25, 25, 10,  5,  5},
+    { 0,  0,  0, 20, 20,  0,  0,  0},
+    { 5, -5,-10,  0,  0,-10, -5,  5},
+    { 5, 10, 10,-20,-20, 10, 10,  5},
+    { 0,  0,  0,  0,  0,  0,  0,  0},
+  },
+  N = {
+    {-50,-40,-30,-30,-30,-30,-40,-50},
+    {-40,-20,  0,  0,  0,  0,-20,-40},
+    {-30,  0, 10, 15, 15, 10,  0,-30},
+    {-30,  5, 15, 20, 20, 15,  5,-30},
+    {-30,  0, 15, 20, 20, 15,  0,-30},
+    {-30,  5, 10, 15, 15, 10,  5,-30},
+    {-40,-20,  0,  5,  5,  0,-20,-40},
+    {-50,-40,-30,-30,-30,-30,-40,-50},
+  },
+  B = {
+    {-20,-10,-10,-10,-10,-10,-10,-20},
+    {-10,  0,  0,  0,  0,  0,  0,-10},
+    {-10,  0,  5, 10, 10,  5,  0,-10},
+    {-10,  5,  5, 10, 10,  5,  5,-10},
+    {-10,  0, 10, 10, 10, 10,  0,-10},
+    {-10, 10, 10, 10, 10, 10, 10,-10},
+    {-10,  5,  0,  0,  0,  0,  5,-10},
+    {-20,-10,-10,-10,-10,-10,-10,-20},
+  },
+  R = {
+    { 0,  0,  0,  5,  5,  0,  0,  0},
+    {-5,  0,  0,  0,  0,  0,  0, -5},
+    {-5,  0,  0,  0,  0,  0,  0, -5},
+    {-5,  0,  0,  0,  0,  0,  0, -5},
+    {-5,  0,  0,  0,  0,  0,  0, -5},
+    {-5,  0,  0,  0,  0,  0,  0, -5},
+    { 5, 10, 10, 10, 10, 10, 10,  5},
+    { 0,  0,  0,  0,  0,  0,  0,  0},
+  },
+  Q = {
+    {-20,-10,-10, -5, -5,-10,-10,-20},
+    {-10,  0,  0,  0,  0,  0,  0,-10},
+    {-10,  0,  5,  5,  5,  5,  0,-10},
+    { -5,  0,  5,  5,  5,  5,  0, -5},
+    {  0,  0,  5,  5,  5,  5,  0, -5},
+    {-10,  5,  5,  5,  5,  5,  0,-10},
+    {-10,  0,  5,  0,  0,  0,  0,-10},
+    {-20,-10,-10, -5, -5,-10,-10,-20},
+  },
+  K = { -- middlegame-ish
+    {-30,-40,-40,-50,-50,-40,-40,-30},
+    {-30,-40,-40,-50,-50,-40,-40,-30},
+    {-30,-30,-30,-40,-40,-30,-30,-30},
+    {-30,-30,-30,-40,-40,-30,-30,-30},
+    {-20,-20,-20,-20,-20,-20,-20,-20},
+    {-10,-10,-10,-10,-10,-10,-10,-10},
+    { 20, 20,  0,  0,  0,  0, 20, 20},
+    { 20, 30, 10,  0,  0, 10, 30, 20},
+  }
+}
+
+local function pstScore(piece, r, c)
+  local up = piece:upper()
+  local tbl = PST[up]
+  if not tbl then return 0 end
+  -- white tables are from white POV (row 1 top). Our board has r=1 at top for black,
+  -- so we mirror for black pieces.
+  if isWhite(piece) then
+    return tbl[r][c]
+  else
+    return tbl[9-r][c]
+  end
+end
+
+local function evaluate(board)
+  -- positive = White better
+  local score = 0
+  local whiteMob, blackMob = 0, 0
+
+  for r=1,8 do
+    for c=1,8 do
+      local p = board[r][c]
+      if p ~= " " then
+        local up = p:upper()
+        local val = VAL[up] or 0
+        local pst = pstScore(p, r, c)
+        if isWhite(p) then score = score + val + pst else score = score - val - pst end
+      end
+    end
+  end
+
+  -- light mobility (optional, cheap): count pseudolegal moves
+  local dummyState = { enpassant=nil, castle={wK=true,wQ=true,bK=true,bQ=true} } -- rough
+  for r=1,8 do for c=1,8 do
+    local p = board[r][c]
+    if p ~= " " then
+      local moves = targetsFor(board, r, c, dummyState)
+      if isWhite(p) then whiteMob = whiteMob + #moves else blackMob = blackMob + #moves end
+    end
+  end end
+  score = score + 2*(whiteMob - blackMob)
+
+  -- king danger: in-check penalty to the side in check
+  if inCheck(board, "white") then score = score - 30 end
+  if inCheck(board, "black") then score = score + 30 end
+
+  return score
+end
+
+-- ======= SEARCH (Alpha-Beta + Quiescence + TT + Iterative Deepening) =======
+local INF = 1e9
+local TT = {} -- transposition table: key -> {depth, score, flag, move}
+-- flag: 0 = exact, -1 = alpha (lower bound), 1 = beta (upper bound)
+
+local killers = {}   -- killers[depth] = { move1, move2 }
+local nodes = 0
+local startTime = 0
+local timeLimit = 1000
+local stopSearch = false
+
+local function ms() return love.timer.getTime() * 1000 end
+
+local function isTimeUp()
+  if (ms() - startTime) >= timeLimit then
+    stopSearch = true
+    return true
+  end
+  return false
+end
+
+local function moveKey(m)
+  -- compact key string for ordering/killers
+  return string.format("%02d%02d%02d%02d%s%s",
+    m.fromR or 0, m.fromC or 0, m.r, m.c, m.castle or "", m.enpassant and "e" or "")
+end
+
+local function orderMoves(board, state, side, moves, pvMove)
+  -- captures first, then castle, then killers, then others
+  local scored = {}
+  for _,m in ipairs(moves) do
+    local score = 0
+    -- MVV-LVA style: check if destination had a capture
+    -- we don't know from here; but we can peek original board:
+    local dest = board[m.r][m.c]
+    if dest ~= " " then
+      local victim = VAL[dest:upper()] or 0
+      score = score + 1000 + victim
+    end
+    if m.castle then score = score + 300 end
+    if pvMove and m.r==pvMove.r and m.c==pvMove.c and m.fromR==pvMove.fromR and m.fromC==pvMove.fromC then
+      score = score + 5000
+    end
+    -- killer moves bonus
+    local mk = moveKey(m)
+    local kd = killers[m.depth or 0]
+    if kd then
+      if kd[1] == mk then score = score + 800 end
+      if kd[2] == mk then score = score + 700 end
+    end
+    table.insert(scored, {m=m, s=score})
+  end
+  table.sort(scored, function(a,b) return a.s > b.s end)
+  local out = {}
+  for _,e in ipairs(scored) do table.insert(out, e.m) end
+  return out
+end
+
+local function quiescence(b, st, side, alpha, beta)
+  nodes = nodes + 1
+  if stopSearch or isTimeUp() then return evaluate(b) end
+
+  local stand = evaluate(b)
+  if stand >= beta then return beta end
+  if stand > alpha then alpha = stand end
+
+  -- only consider "noisy" moves (captures & promotions)
+  for r=1,8 do for c=1,8 do
+    local p = b[r][c]
+    if p ~= " " and colorOf(p)==side then
+      local pseudo = targetsFor(b, r, c, st)
+      for _,m in ipairs(pseudo) do
+        local isCapture = b[m.r][m.c] ~= " "
+        local isPromo = m.promote
+        if isCapture or isPromo then
+          local sim = {}
+          for k,v in pairs(m) do sim[k]=v end
+          if isPromo and not sim.promoPiece then sim.promoPiece = "Q" end
+          local nb, ns = applyMove(b, r, c, sim, st)
+          if not inCheck(nb, side) then
+            local score = -quiescence(nb, ns, opp(side), -beta, -alpha)
+            if score >= beta then return beta end
+            if score > alpha then alpha = score end
+          end
+        end
+      end
+    end
+  end end
+
+  return alpha
+end
+
+local function search(b, st, side, depth, alpha, beta, ply, pvMove)
+  if stopSearch or isTimeUp() then return evaluate(b), nil end
+  nodes = nodes + 1
+
+  if depth == 0 then
+    return quiescence(b, st, side, alpha, beta), nil
+  end
+
+  local key = hashBoard(b, side)
+  local tte = TT[key]
+  if tte and tte.depth >= depth then
+    local s = tte.score
+    if tte.flag == 0 then return s, tte.move end
+    if tte.flag == -1 and s > alpha then alpha = s end
+    if tte.flag == 1 and s < beta  then beta  = s end
+    if alpha >= beta then return s, tte.move end
+  end
+
+  -- generate legal moves
+  local moves = {}
+  for r=1,8 do for c=1,8 do
+    local p = b[r][c]
+    if p ~= " " and colorOf(p)==side then
+      local list = legalTargetsFor(b, r, c, st)
+      for _,m in ipairs(list) do
+        m.fromR, m.fromC = r, c
+        m.depth = ply
+        table.insert(moves, m)
+      end
+    end
+  end end
+
+  if #moves == 0 then
+    -- checkmate or stalemate
+    if inCheck(b, side) then
+      return - (100000 - ply), nil -- mate distance scoring
+    else
+      return 0, nil -- stalemate
+    end
+  end
+
+  moves = orderMoves(b, st, side, moves, pvMove)
+
+  local bestScore = -INF
+  local bestMove = nil
+  local originalAlpha = alpha
+
+  for i,m in ipairs(moves) do
+    local sim = {}
+    for k,v in pairs(m) do sim[k]=v end
+    if m.promote and not sim.promoPiece then sim.promoPiece = "Q" end
+    local nb, ns = applyMove(b, m.fromR, m.fromC, sim, st)
+
+    local score = -search(nb, ns, opp(side), depth-1, -beta, -alpha, ply+1, nil)
+    if score > bestScore then
+      bestScore = score
+      bestMove = m
+      if score > alpha then
+        alpha = score
+        if alpha >= beta then
+          -- store killer
+          killers[ply] = killers[ply] or {}
+          local mk = moveKey(m)
+          killers[ply][2] = killers[ply][1]
+          killers[ply][1] = mk
+          break
+        end
+      end
+    end
+    if stopSearch then break end
+  end
+
+  -- store in TT
+  local flag = 0
+  if bestScore <= originalAlpha then flag = 1   -- upper bound (beta cut for opponent)
+  elseif bestScore >= beta then flag = -1       -- lower bound
+  end
+  TT[key] = { depth = depth, score = bestScore, flag = flag, move = bestMove }
+
+  return bestScore, bestMove
+end
+
+local function aiChooseMove(b, st, side, maxTimeMs, maxDepth)
+  startTime = ms()
+  timeLimit = maxTimeMs or 1000
+  stopSearch = false
+  nodes = 0
+
+  local bestMove, bestScore = nil, -INF
+  local lastPV = nil
+
+  for d=1,(maxDepth or 5) do
+    local score, move = search(b, st, side, d, -INF, INF, 0, lastPV)
+    if stopSearch then break end
+    if move then bestMove = move; bestScore = score; lastPV = move end
+    if isTimeUp() then break end
+  end
+  -- print(("AI depth reached, nodes=%d, best=%.1f"):format(nodes, bestScore))
+  return bestMove
+end
+
+function love.update(dt)
+  if gameOver or promoting then return end
+  if AI_ENABLED and turn == AI_SIDE then
+    -- compute synchronously; for longer times consider coroutine/yielding
+    local move = aiChooseMove(board, state, AI_SIDE, AI_TIME_MS, AI_MAX_DEPTH)
+    if move then
+      -- Promotions from search default to queen; works fine
+      board, state = applyMove(board, move.fromR, move.fromC, move, state)
+      turn = (turn=="white") and "black" or "white"
+      updateStatus()
+    else
+      -- no move (should be game over), but just in case:
+      updateStatus()
+    end
+  end
+end
+
