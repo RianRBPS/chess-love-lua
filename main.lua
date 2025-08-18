@@ -1,4 +1,4 @@
--- main.lua — Legal moves + Castling + En Passant (no UI for promotion choice yet)
+-- main.lua — legal moves + castling + en passant + promotion UI + piece PNGs
 local S = 80 -- square size
 
 -- ======= GAME STATE =======
@@ -12,6 +12,13 @@ local selected = nil
 local legalTargets = {}
 local statusText = ""
 local gameOver = false
+
+-- promotion UI state: when set, blocks board input until a choice is made
+-- { fromR, fromC, toR, toC, side }
+local promoting = nil
+
+-- sprites (loaded if PNGs exist)
+local sprites = {} -- e.g., sprites["wP"] = Image, sprites["bQ"]=Image
 
 -- start position (top = black, bottom = white)
 local startpos = {
@@ -58,6 +65,13 @@ local function dirForPawn(color) return (color=="white") and -1 or 1 end
 local function startRankForPawn(color) return (color=="white") and 7 or 2 end
 local function lastRankForPawn(color) return (color=="white") and 1 or 8 end
 
+local function pieceKeyFromChar(ch)
+  if ch==" " then return nil end
+  local side = isWhite(ch) and "w" or "b"
+  local t = ch:upper()
+  return side .. t -- e.g., "wP", "bQ"
+end
+
 -- Sliding helper for B/R/Q
 local function slideDirections(ch)
   if ch=="B" or ch=="b" then
@@ -68,6 +82,37 @@ local function slideDirections(ch)
     return {{-1,-1},{-1,1},{1,-1},{1,1},{-1,0},{1,0},{0,-1},{0,1}}
   else
     return {}
+  end
+end
+
+-- ======= SPRITES =======
+local function tryLoad(imgPath)
+  local ok, img = pcall(love.graphics.newImage, imgPath)
+  if ok then return img end
+  return nil
+end
+
+local function loadSprites()
+  local names = {"P","R","N","B","Q","K"}
+  for _,n in ipairs(names) do
+    sprites["w"..n] = tryLoad("assets/w"..n..".png")
+    sprites["b"..n] = tryLoad("assets/b"..n..".png")
+  end
+end
+
+local function drawPiece(piece, x, y)
+  local key = pieceKeyFromChar(piece)
+  local img = key and sprites[key] or nil
+  if img then
+    local iw, ih = img:getWidth(), img:getHeight()
+    local scale = math.min(S/iw, S/ih)
+    local offx = (S - iw*scale) / 2
+    local offy = (S - ih*scale) / 2
+    love.graphics.setColor(1,1,1)
+    love.graphics.draw(img, x+offx, y+offy, 0, scale, scale)
+  else
+    love.graphics.setColor(0,0,0)
+    love.graphics.printf(piece, x, y + S/3, S, "center")
   end
 end
 
@@ -153,8 +198,8 @@ local function inCheck(b, side)
   return squareAttackedBy(b, kr, kc, opp(side))
 end
 
--- ======= MOVE GEN (PSEUDO, needs state for special rules) =======
--- Returns list of moves { r=toR, c=toC, castle="K"/"Q"|nil, enpassant=true|nil }
+-- ======= MOVE GEN (PSEUDO, incl. promo flags, castle, en passant) =======
+-- Returns list of moves { r=toR, c=toC, castle="K"/"Q"|nil, enpassant=true|nil, promote=true|nil }
 local function targetsFor(b, r, c, st)
   local piece = b[r][c]
   if piece==" " then return {} end
@@ -164,20 +209,23 @@ local function targetsFor(b, r, c, st)
   local function add(rr,cc, captureOnly, emptyOnly, flags)
     if not inBounds(rr,cc) then return end
     local dest = b[rr][cc]
+    local f = {}
+    if flags then for k,v in pairs(flags) do f[k]=v end end
+
+    local willPromote = (piece:lower()=="p" and rr == lastRankForPawn(side))
+    if willPromote then f.promote = true end
+
     if captureOnly then
       if dest~=" " and colorOf(dest) ~= side then
-        local m = {r=rr,c=cc}; if flags then for k,v in pairs(flags) do m[k]=v end end
-        table.insert(t, m)
+        table.insert(t, {r=rr,c=cc, castle=f.castle, enpassant=f.enpassant, promote=f.promote})
       end
     elseif emptyOnly then
       if dest==" " then
-        local m = {r=rr,c=cc}; if flags then for k,v in pairs(flags) do m[k]=v end end
-        table.insert(t, m)
+        table.insert(t, {r=rr,c=cc, castle=f.castle, enpassant=f.enpassant, promote=f.promote})
       end
     else
       if dest==" " or colorOf(dest) ~= side then
-        local m = {r=rr,c=cc}; if flags then for k,v in pairs(flags) do m[k]=v end end
-        table.insert(t, m)
+        table.insert(t, {r=rr,c=cc, castle=f.castle, enpassant=f.enpassant, promote=f.promote})
       end
     end
   end
@@ -200,8 +248,7 @@ local function targetsFor(b, r, c, st)
     if st.enpassant then
       for _,dc in ipairs({-1,1}) do
         local er,ec = r+d, c+dc
-        if er==st.enpassant.r and ec==st.enpassant.c and b[r][c]~=" " and b[er][ec]==" " then
-          -- destination empty but capture is the pawn beside you
+        if er==st.enpassant.r and ec==st.enpassant.c and b[er][ec]==" " then
           add(er, ec, false, false, { enpassant = true })
         end
       end
@@ -219,9 +266,7 @@ local function targetsFor(b, r, c, st)
       end
     end
     -- castling (check squares not attacked & path empty & rights)
-    -- white king on e1 = (8,5), black king on e8 = (1,5)
     if side=="white" and r==8 and c==5 then
-      -- King side: e1->g1 (f1,g1 empty), rook h1 present, rights wK
       if st.castle.wK and b[8][6]==" " and b[8][7]==" " and b[8][8]:lower()=="r" then
         if not inCheck(b,"white")
            and not squareAttackedBy(b,8,6,"black")
@@ -229,7 +274,6 @@ local function targetsFor(b, r, c, st)
           add(8,7,false,false,{ castle="K" })
         end
       end
-      -- Queen side: e1->c1 (d1,c1,b1 empty), rook a1 present, rights wQ
       if st.castle.wQ and b[8][4]==" " and b[8][3]==" " and b[8][2]==" " and b[8][1]:lower()=="r" then
         if not inCheck(b,"white")
            and not squareAttackedBy(b,8,4,"black")
@@ -238,7 +282,6 @@ local function targetsFor(b, r, c, st)
         end
       end
     elseif side=="black" and r==1 and c==5 then
-      -- King side: e8->g8
       if st.castle.bK and b[1][6]==" " and b[1][7]==" " and b[1][8]:lower()=="r" then
         if not inCheck(b,"black")
            and not squareAttackedBy(b,1,6,"white")
@@ -246,7 +289,6 @@ local function targetsFor(b, r, c, st)
           add(1,7,false,false,{ castle="K" })
         end
       end
-      -- Queen side: e8->c8
       if st.castle.bQ and b[1][4]==" " and b[1][3]==" " and b[1][2]==" " and b[1][1]:lower()=="r" then
         if not inCheck(b,"black")
            and not squareAttackedBy(b,1,4,"white")
@@ -276,7 +318,7 @@ local function targetsFor(b, r, c, st)
 end
 
 -- ======= APPLY MOVE (PURE: returns nb, nstate) =======
--- move fields: r,c, and optional castle="K"/"Q", enpassant=true
+-- move fields: r,c, and optional castle="K"/"Q", enpassant=true, promote=true, promoPiece="Q"/"R"/"B"/"N"
 local function applyMove(b, fromR,fromC, move, st)
   local nb = cloneBoard(b)
   local ns = cloneState(st)
@@ -288,32 +330,28 @@ local function applyMove(b, fromR,fromC, move, st)
 
   -- en passant capture: remove pawn from original file
   if move.enpassant then
-    -- captured pawn is on the fromR, toC square
     nb[fromR][toC] = " "
   end
 
   -- castling: also move rook
   if move.castle == "K" then
     if side=="white" then
-      -- King e1->g1, rook h1->f1  (coords: (8,5)->(8,7); (8,8)->(8,6))
       nb[8][6] = nb[8][8]; nb[8][8] = " "
     else
-      -- King e8->g8; rook h8->f8  (1,5)->(1,7); (1,8)->(1,6)
       nb[1][6] = nb[1][8]; nb[1][8] = " "
     end
   elseif move.castle == "Q" then
     if side=="white" then
-      -- King e1->c1; rook a1->d1  (8,5)->(8,3); (8,1)->(8,4)
       nb[8][4] = nb[8][1]; nb[8][1] = " "
     else
-      -- King e8->c8; rook a8->d8  (1,5)->(1,3); (1,1)->(1,4)
       nb[1][4] = nb[1][1]; nb[1][1] = " "
     end
   end
 
   -- place moving piece (handle promotion)
   if piece:lower()=="p" and toR == lastRankForPawn(side) then
-    nb[toR][toC] = isWhite(piece) and "Q" or "q"
+    local promoteTo = (move.promoPiece or "Q")
+    nb[toR][toC] = (side=="white") and promoteTo or promoteTo:lower()
   else
     nb[toR][toC] = piece
   end
@@ -329,22 +367,17 @@ local function applyMove(b, fromR,fromC, move, st)
     end
   end
 
-  -- if king moves (or castles) → both rights gone
   if piece=="K" then disableRights("white","both") end
   if piece=="k" then disableRights("black","both") end
 
-  -- if rook moves from original square → disable corresponding side
   if piece=="R" then
-    if fromR==8 and fromC==8 then disableRights("white","K") end -- h1
-    if fromR==8 and fromC==1 then disableRights("white","Q") end -- a1
+    if fromR==8 and fromC==8 then disableRights("white","K") end
+    if fromR==8 and fromC==1 then disableRights("white","Q") end
   elseif piece=="r" then
-    if fromR==1 and fromC==8 then disableRights("black","K") end -- h8
-    if fromR==1 and fromC==1 then disableRights("black","Q") end -- a8
+    if fromR==1 and fromC==8 then disableRights("black","K") end
+    if fromR==1 and fromC==1 then disableRights("black","Q") end
   end
 
-  -- if a rook is captured on its original square → disable that right
-  -- (check the destination square BEFORE we replaced; but we already placed piece.
-  -- So look at 'b' (old board) at destination to see what was captured.)
   local captured = b[toR][toC]
   if captured=="R" then
     if toR==8 and toC==8 then disableRights("white","K") end
@@ -354,7 +387,6 @@ local function applyMove(b, fromR,fromC, move, st)
     if toR==1 and toC==1 then disableRights("black","Q") end
   end
 
-  -- if castled → obviously rights are gone
   if move.castle then
     disableRights(side,"both")
   end
@@ -364,7 +396,6 @@ local function applyMove(b, fromR,fromC, move, st)
   if piece:lower()=="p" then
     local d = dirForPawn(side)
     if math.abs(toR - fromR) == 2 then
-      -- target is the square jumped over
       ns.enpassant = { r = fromR + d, c = fromC }
     end
   end
@@ -382,7 +413,11 @@ local function legalTargetsFor(b, r, c, st)
   local out = {}
   local pseudo = targetsFor(b, r, c, st)
   for _,m in ipairs(pseudo) do
-    local nb, ns = applyMove(b, r, c, m, st)
+    -- simulate with default queen promo to ensure king safety is tested
+    local simMove = {}
+    for k,v in pairs(m) do simMove[k]=v end
+    if m.promote and not simMove.promoPiece then simMove.promoPiece = "Q" end
+    local nb, ns = applyMove(b, r, c, simMove, st)
     if not inCheck(nb, side) then
       table.insert(out, m)
     end
@@ -397,7 +432,10 @@ local function anyLegalMove(b, side, st)
       if p ~= " " and colorOf(p)==side then
         local pseudo = targetsFor(b, r, c, st)
         for _,m in ipairs(pseudo) do
-          local nb, ns = applyMove(b, r, c, m, st)
+          local simMove = {}
+          for k,v in pairs(m) do simMove[k]=v end
+          if m.promote and not simMove.promoPiece then simMove.promoPiece = "Q" end
+          local nb, ns = applyMove(b, r, c, simMove, st)
           if not inCheck(nb, side) then return true end
         end
       end
@@ -437,20 +475,105 @@ local function findInTargets(list, r,c)
   return nil
 end
 
-function love.load()
+local function startPosition()
   for r=1,8 do
     board[r] = {}
     for c=1,8 do board[r][c] = startpos[r][c] end
   end
   state = { castle = { wK=true,wQ=true,bK=true,bQ=true }, enpassant=nil }
-  turn, selected, legalTargets, gameOver, statusText = "white", nil, {}, false, ""
+  turn, selected, legalTargets, gameOver, statusText, promoting =
+      "white", nil, {}, false, "", nil
+end
+
+function love.load()
   love.window.setMode(S*8, S*8)
-  love.window.setTitle("Lua + LÖVE Chess — castling + en passant")
+  love.window.setTitle("Lua + LÖVE Chess — promotion UI + sprites")
+  loadSprites()
+  startPosition()
   updateStatus()
 end
 
 function love.keypressed(key)
-  if key=="r" then love.load() end
+  if key=="r" then startPosition(); updateStatus() end
+end
+
+-- Promotion modal layout
+local function promotionButtons(side)
+  -- Return a table of buttons {x,y,w,h,label,imgKey,pieceLetter}
+  local W, H = 360, 120
+  local cx = (S*8 - W)/2
+  local cy = (S*8 - H)/2
+  local opts = {"Q","R","B","N"}
+  local btns = {}
+  local bw, bh = 80, 80
+  local pad = 10
+  local x = cx + 10
+  for i,lab in ipairs(opts) do
+    local y = cy + (H - bh)/2
+    table.insert(btns, {
+      x=x, y=y, w=bw, h=bh,
+      label=lab,
+      imgKey=(side=="white" and "w"..lab or "b"..lab),
+      pieceLetter=lab
+    })
+    x = x + bw + pad
+  end
+  return {x=cx,y=cy,w=W,h=H, btns=btns}
+end
+
+local function drawPromotionUI()
+  if not promoting then return end
+  local side = promoting.side
+  local ui = promotionButtons(side)
+
+  -- modal bg
+  love.graphics.setColor(0,0,0,0.45)
+  love.graphics.rectangle("fill", 0,0, S*8, S*8)
+
+  -- panel
+  love.graphics.setColor(0.95,0.95,0.95)
+  love.graphics.rectangle("fill", ui.x, ui.y, ui.w, ui.h, 8,8)
+  love.graphics.setColor(0,0,0)
+  love.graphics.print("Choose promotion", ui.x+10, ui.y+8)
+
+  -- buttons
+  for _,b in ipairs(ui.btns) do
+    love.graphics.setColor(0.85,0.85,0.85)
+    love.graphics.rectangle("fill", b.x, b.y, b.w, b.h, 6,6)
+    love.graphics.setColor(0,0,0)
+    love.graphics.rectangle("line", b.x, b.y, b.w, b.h, 6,6)
+    -- icon or letter
+    local img = sprites[b.imgKey]
+    if img then
+      local iw,ih = img:getWidth(), img:getHeight()
+      local scale = math.min((b.w-10)/iw, (b.h-10)/ih)
+      local offx = (b.w - iw*scale)/2
+      local offy = (b.h - ih*scale)/2
+      love.graphics.setColor(1,1,1)
+      love.graphics.draw(img, b.x+offx, b.y+offy, 0, scale, scale)
+    else
+      love.graphics.setColor(0,0,0)
+      love.graphics.printf(b.pieceLetter, b.x, b.y + b.h/3, b.w, "center")
+    end
+  end
+end
+
+local function clickPromotion(x,y)
+  if not promoting then return false end
+  local side = promoting.side
+  local ui = promotionButtons(side)
+  for _,b in ipairs(ui.btns) do
+    if x>=b.x and x<=b.x+b.w and y>=b.y and y<=b.y+b.h then
+      -- apply chosen promotion
+      local move = { r=promoting.toR, c=promoting.toC, promote=true, promoPiece=b.pieceLetter }
+      board, state = applyMove(board, promoting.fromR, promoting.fromC, move, state)
+      turn = opp(turn)
+      promoting = nil
+      updateStatus()
+      return true
+    end
+  end
+  return false
 end
 
 function love.draw()
@@ -462,16 +585,16 @@ function love.draw()
     end
   end
 
-  -- selection
-  if selected then
-    love.graphics.setColor(1,1,0,0.35)
-    love.graphics.rectangle("fill", (selected.c-1)*S, (selected.r-1)*S, S, S)
-  end
-
-  -- legal target dots
-  for _,m in ipairs(legalTargets) do
-    love.graphics.setColor(0,0,0,0.35)
-    love.graphics.circle("fill", (m.c-0.5)*S, (m.r-0.5)*S, S*0.15)
+  -- selection and legal target dots (only when not promoting)
+  if not promoting then
+    if selected then
+      love.graphics.setColor(1,1,0,0.35)
+      love.graphics.rectangle("fill", (selected.c-1)*S, (selected.r-1)*S, S, S)
+    end
+    for _,m in ipairs(legalTargets) do
+      love.graphics.setColor(0,0,0,0.35)
+      love.graphics.circle("fill", (m.c-0.5)*S, (m.r-0.5)*S, S*0.15)
+    end
   end
 
   -- pieces
@@ -479,8 +602,7 @@ function love.draw()
     for c=1,8 do
       local piece = board[r][c]
       if piece ~= " " then
-        love.graphics.setColor(0,0,0)
-        love.graphics.printf(piece, (c-1)*S, (r-1)*S + S/3, S, "center")
+        drawPiece(piece, (c-1)*S, (r-1)*S)
       end
     end
   end
@@ -497,10 +619,21 @@ function love.draw()
   if gameOver then
     love.graphics.print("Game Over — press R to restart", 8, 68)
   end
+
+  -- Promotion modal (on top)
+  drawPromotionUI()
 end
 
 function love.mousepressed(x,y,button)
   if button ~= 1 or gameOver then return end
+
+  -- promotion UI click has priority
+  if promoting then
+    if clickPromotion(x,y) then return end
+    -- click outside does nothing
+    return
+  end
+
   local r,c = coordsToSquare(x,y)
   if not r then return end
 
@@ -511,9 +644,17 @@ function love.mousepressed(x,y,button)
       legalTargets = legalTargetsFor(board, r, c, state)
     end
   else
-    local move = findInTargets(legalTargets, r, c)
-    if move then
-      board, state = applyMove(board, selected.r, selected.c, move, state)
+    local m = findInTargets(legalTargets, r, c)
+    if m then
+      -- If this move promotes, open UI instead of applying now
+      if m.promote then
+        promoting = { fromR=selected.r, fromC=selected.c, toR=r, toC=c, side=turn }
+        -- clear UI selection behind modal
+        selected, legalTargets = nil, {}
+        return
+      end
+      -- normal move
+      board, state = applyMove(board, selected.r, selected.c, m, state)
       turn = opp(turn)
       selected, legalTargets = nil, {}
       updateStatus()
