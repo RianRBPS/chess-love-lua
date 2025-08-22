@@ -2,9 +2,13 @@ local S = 80 -- square size
 
 -- ======= AI SETTINGS =======
 local AI_ENABLED   = true      -- set true to play vs AI (AI plays Black)
-local AI_SIDE      = "black"
+local AI_SIDE      = nill
 local AI_TIME_MS   = 3500      -- time per move in milliseconds (increase for stronger play)
 local AI_MAX_DEPTH = 6         -- safety cap (iterative deepening will stop earlier if time ends)
+
+-- ======= FORWARD DECLARATIONS =======
+local aiChooseMove  -- so love.load can see it
+local initZobrist
 
 -- ======= GAME STATE =======
 local board = {}
@@ -496,11 +500,45 @@ function love.load()
   loadSprites()
   initZobrist()
   startPosition()
+
+  -- Randomize who is the AI
+  if love.math.random() < 0.5 then
+    AI_SIDE = "white"
+  else
+    AI_SIDE = "black"
+  end
+
+  -- If AI got White, let it play immediately
+  if AI_ENABLED and AI_SIDE == "white" then
+    local move = aiChooseMove(board, state, "white", AI_TIME_MS, AI_MAX_DEPTH)
+    if move then
+      board, state = applyMove(board, move.fromR, move.fromC, move, state)
+      turn = "black"
+    end
+  end
+
   updateStatus()
 end
 
+
 function love.keypressed(key)
-  if key=="r" then startPosition(); updateStatus() end
+  if key=="r" then
+    startPosition()
+
+    -- Randomize who is the AI each new game
+    AI_SIDE = (love.math.random() < 0.5) and "white" or "black"
+
+    -- If AI is White, let it move first
+    if AI_ENABLED and AI_SIDE == "white" and not gameOver then
+      local move = aiChooseMove(board, state, "white", AI_TIME_MS, AI_MAX_DEPTH)
+      if move then
+        board, state = applyMove(board, move.fromR, move.fromC, move, state)
+        turn = "black"
+      end
+    end
+
+    updateStatus()
+  end
 end
 
 -- Promotion modal layout
@@ -1236,7 +1274,7 @@ local function search(b, st, side, depth, alpha, beta, ply, pvMove)
   return bestScore, bestMove
 end
 
-local function aiChooseMove(b, st, side, maxTimeMs, maxDepth)
+function aiChooseMove(b, st, side, maxTimeMs, maxDepth)
   startTime = ms()
   timeLimit = maxTimeMs or 1000
   stopSearch = false
