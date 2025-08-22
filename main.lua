@@ -2,9 +2,11 @@ local S = 80 -- square size
 
 -- ======= AI SETTINGS =======
 local AI_ENABLED   = true      -- set true to play vs AI (AI plays Black)
-local AI_SIDE      = nill
+local AI_SIDE      = nil
 local AI_TIME_MS   = 3500      -- time per move in milliseconds (increase for stronger play)
 local AI_MAX_DEPTH = 6         -- safety cap (iterative deepening will stop earlier if time ends)
+local PLAYER_SIDE = "white"     -- set at start/restart
+local VIEW_FLIPPED = false      -- true when player is black 
 
 -- ======= FORWARD DECLARATIONS =======
 local aiChooseMove  -- so love.load can see it
@@ -472,12 +474,6 @@ local function updateStatus()
 end
 
 -- ======= UI helpers & LOVE callbacks =======
-local function coordsToSquare(x,y)
-  local c = math.floor(x / S) + 1
-  local r = math.floor(y / S) + 1
-  if inBounds(r,c) then return r,c end
-  return nil,nil
-end
 
 local function findInTargets(list, r,c)
   for _,m in ipairs(list) do if m.r==r and m.c==c then return m end end
@@ -501,42 +497,21 @@ function love.load()
   initZobrist()
   startPosition()
 
-  -- Randomize who is the AI
-  if love.math.random() < 0.5 then
-    AI_SIDE = "white"
-  else
-    AI_SIDE = "black"
-  end
+  AI_SIDE = (love.math.random() < 0.5) and "white" or "black"
+  PLAYER_SIDE = AI_ENABLED and ((AI_SIDE == "white") and "black" or "white") or "white"
+  VIEW_FLIPPED = (PLAYER_SIDE == "black")
 
-  -- If AI got White, let it play immediately
-  if AI_ENABLED and AI_SIDE == "white" then
-    local move = aiChooseMove(board, state, "white", AI_TIME_MS, AI_MAX_DEPTH)
-    if move then
-      board, state = applyMove(board, move.fromR, move.fromC, move, state)
-      turn = "black"
-    end
-  end
 
   updateStatus()
 end
 
 
 function love.keypressed(key)
-  if key=="r" then
+  if key == "r" then
     startPosition()
-
-    -- Randomize who is the AI each new game
     AI_SIDE = (love.math.random() < 0.5) and "white" or "black"
-
-    -- If AI is White, let it move first
-    if AI_ENABLED and AI_SIDE == "white" and not gameOver then
-      local move = aiChooseMove(board, state, "white", AI_TIME_MS, AI_MAX_DEPTH)
-      if move then
-        board, state = applyMove(board, move.fromR, move.fromC, move, state)
-        turn = "black"
-      end
-    end
-
+    PLAYER_SIDE = AI_ENABLED and ((AI_SIDE == "white") and "black" or "white") or "white"
+    VIEW_FLIPPED = (PLAYER_SIDE == "black")
     updateStatus()
   end
 end
@@ -620,24 +595,52 @@ local function clickPromotion(x,y)
   return false
 end
 
+local function squareToScreen(r, c)
+  -- returns top-left pixel for square (r,c)
+  if not VIEW_FLIPPED then
+    return (c-1)*S, (r-1)*S
+  else
+    return (8-c)*S, (8-r)*S
+  end
+end
+
+local function coordsToSquare(x, y)
+  -- inverse: screen → board (r,c) or nil
+  local cc = math.floor(x / S)
+  local rr = math.floor(y / S)
+  local r, c
+  if not VIEW_FLIPPED then
+    r, c = rr+1, cc+1
+  else
+    r, c = 8-rr, 8-cc
+  end
+  if inBounds(r, c) then return r, c end
+  return nil, nil
+end
+
 function love.draw()
-  -- board
+  -- board squares
   for r=1,8 do
     for c=1,8 do
+      local x, y = squareToScreen(r, c)
       if (r+c)%2==0 then love.graphics.setColor(0.9,0.9,0.9) else love.graphics.setColor(0.25,0.45,0.25) end
-      love.graphics.rectangle("fill", (c-1)*S, (r-1)*S, S, S)
+      love.graphics.rectangle("fill", x, y, S, S)
     end
   end
 
-  -- selection and legal target dots (only when not promoting)
+  -- selection highlight
+  if not promoting and selected then
+    local x, y = squareToScreen(selected.r, selected.c)
+    love.graphics.setColor(1,1,0,0.35)
+    love.graphics.rectangle("fill", x, y, S, S)
+  end
+
+  -- legal target dots
   if not promoting then
-    if selected then
-      love.graphics.setColor(1,1,0,0.35)
-      love.graphics.rectangle("fill", (selected.c-1)*S, (selected.r-1)*S, S, S)
-    end
     for _,m in ipairs(legalTargets) do
+      local x, y = squareToScreen(m.r, m.c)
       love.graphics.setColor(0,0,0,0.35)
-      love.graphics.circle("fill", (m.c-0.5)*S, (m.r-0.5)*S, S*0.15)
+      love.graphics.circle("fill", x + S*0.5, y + S*0.5, S*0.15)
     end
   end
 
@@ -646,10 +649,12 @@ function love.draw()
     for c=1,8 do
       local piece = board[r][c]
       if piece ~= " " then
-        drawPiece(piece, (c-1)*S, (r-1)*S)
+        local x, y = squareToScreen(r, c)
+        drawPiece(piece, x, y)
       end
     end
   end
+
 
   -- HUD
   love.graphics.setColor(0,0,0)
