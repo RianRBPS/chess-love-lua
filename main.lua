@@ -3,7 +3,7 @@ local S = 80 -- square size
 -- ======= AI SETTINGS =======
 local AI_ENABLED   = true      -- set true to play vs AI (AI plays Black)
 local AI_SIDE      = "black"
-local AI_TIME_MS   = 3500   -- time per move in milliseconds (increase for stronger play)
+local AI_TIME_MS   = 3500      -- time per move in milliseconds (increase for stronger play)
 local AI_MAX_DEPTH = 6         -- safety cap (iterative deepening will stop earlier if time ends)
 
 -- ======= GAME STATE =======
@@ -687,7 +687,6 @@ local function rand32()
   return bit.bxor(x, bit.lshift(x, 16))
 end
 
-
 function initZobrist()
   local pieces = {"P","N","B","R","Q","K","p","n","b","r","q","k"}
   for _,pc in ipairs(pieces) do
@@ -716,6 +715,9 @@ end
 
 -- ======= EVALUATION =======
 local VAL = { P=100, N=320, B=330, R=500, Q=900, K=0 }
+-- material table for SEE (king huge to avoid nonsense)
+local VAL_MAT   = { P=100, N=320, B=330, R=500, Q=900, K=20000 }
+
 -- simple piece-square tables (white perspective; black uses mirrored)
 local PST = {
   P = {
@@ -784,12 +786,114 @@ local function pstScore(piece, r, c)
   local up = piece:upper()
   local tbl = PST[up]
   if not tbl then return 0 end
-  -- white tables are from white POV (row 1 top). Our board has r=1 at top for black,
-  -- so we mirror for black pieces.
   if isWhite(piece) then
     return tbl[r][c]
   else
     return tbl[9-r][c]
+  end
+end
+
+-- ======= SEE (Static Exchange Evaluation) =======
+local LVA_ORDER = { P=1, N=2, B=3, R=4, Q=5, K=6 }
+
+local function attackersToSquare(b, r, c, side)
+  local out = {}
+  -- pawns
+  local d = dirForPawn(side)
+  for _,dc in ipairs({-1,1}) do
+    local rr,cc = r - d, c - dc
+    if inBounds(rr,cc) then
+      local p = b[rr][cc]
+      if side=="white" and p=="P" then table.insert(out,{r=rr,c=cc,p="P"}) end
+      if side=="black" and p=="p" then table.insert(out,{r=rr,c=cc,p="p"}) end
+    end
+  end
+  -- knights
+  local jumps={{-2,-1},{-2,1},{-1,-2},{-1,2},{1,-2},{1,2},{2,-1},{2,1}}
+  for _,d2 in ipairs(jumps) do
+    local rr,cc=r+d2[1],c+d2[2]
+    if inBounds(rr,cc) then
+      local p=b[rr][cc]
+      if side=="white" and p=="N" then table.insert(out,{r=rr,c=cc,p="N"}) end
+      if side=="black" and p=="n" then table.insert(out,{r=rr,c=cc,p="n"}) end
+    end
+  end
+  -- king
+  for dr=-1,1 do for dc=-1,1 do
+    if not (dr==0 and dc==0) then
+      local rr,cc=r+dr,c+dc
+      if inBounds(rr,cc) then
+        local p=b[rr][cc]
+        if side=="white" and p=="K" then table.insert(out,{r=rr,c=cc,p="K"}) end
+        if side=="black" and p=="k" then table.insert(out,{r=rr,c=cc,p="k"}) end
+      end
+    end
+  end end
+  -- sliders
+  local function ray(drs,dcs,chars)
+    local rr,cc=r+drs,c+dcs
+    while inBounds(rr,cc) do
+      local p=b[rr][cc]
+      if p~=" " then
+        if side=="white" and isWhite(p) and chars[p] then table.insert(out,{r=rr,c=cc,p=p}) end
+        if side=="black" and isBlack(p) and chars[p] then table.insert(out,{r=rr,c=cc,p=p}) end
+        break
+      end
+      rr,cc=rr+drs,cc+dcs
+    end
+  end
+  local Wdiag={B=true,Q=true}; local Bdiag={b=true,q=true}
+  local Worth={R=true,Q=true};  local Borth={r=true,q=true}
+  ray(-1,-1, side=="white" and Wdiag or Bdiag)
+  ray(-1, 1, side=="white" and Wdiag or Bdiag)
+  ray( 1,-1, side=="white" and Wdiag or Bdiag)
+  ray( 1, 1, side=="white" and Wdiag or Bdiag)
+  ray(-1, 0, side=="white" and Worth or Borth)
+  ray( 1, 0, side=="white" and Worth or Borth)
+  ray( 0,-1, side=="white" and Worth or Borth)
+  ray( 0, 1, side=="white" and Worth or Borth)
+  return out
+end
+
+local function lvaLess(a,b)
+  local A = a.p:upper(); local B = b.p:upper()
+  if LVA_ORDER[A] ~= LVA_ORDER[B] then return LVA_ORDER[A] < LVA_ORDER[B] end
+  local ia=(a.r-1)*8+a.c; local ib=(b.r-1)*8+b.c
+  return ia < ib
+end
+
+-- SEE: net material (centipawns) for side-to-move capturing on (toR,toC)
+local function SEE(b, fromR, fromC, toR, toC)
+  local piece = b[fromR][fromC]; if piece==" " then return 0 end
+  local us = colorOf(piece); local them = opp(us)
+  local target = b[toR][toC]
+  local nb = cloneBoard(b)
+
+  local function gain(sideToMove, r, c, curVictim)
+    local attackers = attackersToSquare(nb, r, c, sideToMove)
+    if #attackers == 0 then return nil end
+    table.sort(attackers, lvaLess)
+    local atk = attackers[1]
+    local atkPiece = nb[atk.r][atk.c]
+    nb[atk.r][atk.c] = " "
+    local capturedValue = VAL_MAT[curVictim]
+    nb[r][c] = atkPiece
+    local reply = gain(opp(sideToMove), r, c, atkPiece:upper())
+    local thisScore = capturedValue
+    if reply ~= nil then thisScore = capturedValue - reply end
+    return math.max(thisScore, 0)
+  end
+
+  if target == " " then return 0 end
+  nb[fromR][fromC] = " "
+  nb[toR][toC] = piece
+
+  local ourGain = VAL_MAT[target:upper()]
+  local reply = gain(them, toR, toC, piece:upper())
+  if reply ~= nil then
+    return ourGain - reply
+  else
+    return ourGain
   end
 end
 
@@ -810,8 +914,8 @@ local function evaluate(board)
     end
   end
 
-  -- light mobility (optional, cheap): count pseudolegal moves
-  local dummyState = { enpassant=nil, castle={wK=true,wQ=true,bK=true,bQ=true} } -- rough
+  -- light mobility (optional, cheap)
+  local dummyState = { enpassant=nil, castle={wK=true,wQ=true,bK=true,bQ=true} }
   for r=1,8 do for c=1,8 do
     local p = board[r][c]
     if p ~= " " then
@@ -821,11 +925,71 @@ local function evaluate(board)
   end end
   score = score + 2*(whiteMob - blackMob)
 
-  -- king danger: in-check penalty to the side in check
+  -- king danger
   if inCheck(board, "white") then score = score - 30 end
   if inCheck(board, "black") then score = score + 30 end
 
+  -- small nudge: penalize truly hanging queens
+  local function queenEnPrisePenalty()
+    for r=1,8 do for c=1,8 do
+      local p = board[r][c]
+      if p=="Q" then
+        if squareAttackedBy(board, r, c, "black") then
+          local atks = attackersToSquare(board, r, c, "black")
+          for _,a in ipairs(atks) do
+            local see = SEE(board, a.r, a.c, r, c)
+            if see > 0 then return -200 end
+          end
+        end
+      elseif p=="q" then
+        if squareAttackedBy(board, r, c, "white") then
+          local atks = attackersToSquare(board, r, c, "white")
+          for _,a in ipairs(atks) do
+            local see = SEE(board, a.r, a.c, r, c)
+            if see > 0 then return 200 end
+          end
+        end
+      end
+    end end
+    return 0
+  end
+  score = score + queenEnPrisePenalty()
+
   return score
+end
+
+-- Returns true if the opponent can profitably capture the piece on (r,c) in nb
+local function opponentProfitsCapturing(nb, r, c, opponentSide)
+  if not squareAttackedBy(nb, r, c, opponentSide) then return false end
+  local atks = attackersToSquare(nb, r, c, opponentSide)
+  for _,a in ipairs(atks) do
+    local see = SEE(nb, a.r, a.c, r, c)
+    if see > 0 then return true end
+  end
+  return false
+end
+
+local function findQueen(b, side)
+  for r=1,8 do
+    for c=1,8 do
+      local p = b[r][c]
+      if p ~= " " and colorOf(p) == side and p:upper() == "Q" then
+        return r, c
+      end
+    end
+  end
+  return nil, nil
+end
+
+local function isQueenHanging(b, side)
+  local qr, qc = findQueen(b, side)
+  if not qr then return false end
+  return opponentProfitsCapturing(b, qr, qc, opp(side))
+end
+
+-- Big pieces we should avoid hanging on purpose (generalized guard)
+local function isBigPieceChar(up)
+  return (up=="Q" or up=="R" or up=="B" or up=="N")
 end
 
 -- ======= SEARCH (Alpha-Beta + Quiescence + TT + Iterative Deepening) =======
@@ -850,39 +1014,43 @@ local function isTimeUp()
 end
 
 local function moveKey(m)
-  -- compact key string for ordering/killers
   return string.format("%02d%02d%02d%02d%s%s",
     m.fromR or 0, m.fromC or 0, m.r, m.c, m.castle or "", m.enpassant and "e" or "")
 end
 
+-- ======= ORDERING (uses SEE to punish bad captures) =======
 local function orderMoves(board, state, side, moves, pvMove)
-  -- captures first, then castle, then killers, then others
   local scored = {}
   for _,m in ipairs(moves) do
     local score = 0
-    -- MVV-LVA style: check if destination had a capture
-    -- we don't know from here; but we can peek original board:
     local dest = board[m.r][m.c]
-    if dest ~= " " then
+    local isCap = dest ~= " "
+
+    if isCap then
       local victim = VAL[dest:upper()] or 0
       score = score + 1000 + victim
+      local see = SEE(board, m.fromR, m.fromC, m.r, m.c)
+      score = score + see                    -- losing captures sink
     end
-    if m.castle then score = score + 300 end
+    if m.promote then score = score + 900 end
+    if m.castle then score = score + 150 end
+
     if pvMove and m.r==pvMove.r and m.c==pvMove.c and m.fromR==pvMove.fromR and m.fromC==pvMove.fromC then
       score = score + 5000
     end
-    -- killer moves bonus
+
     local mk = moveKey(m)
     local kd = killers[m.depth or 0]
     if kd then
-      if kd[1] == mk then score = score + 800 end
-      if kd[2] == mk then score = score + 700 end
+      if kd[1] == mk then score = score + 400 end
+      if kd[2] == mk then score = score + 300 end
     end
+
     table.insert(scored, {m=m, s=score})
   end
   table.sort(scored, function(a,b) return a.s > b.s end)
   local out = {}
-  for _,e in ipairs(scored) do table.insert(out, e.m) end
+  for _,e in ipairs(scored) do out[#out+1] = e.m end
   return out
 end
 
@@ -903,14 +1071,33 @@ local function quiescence(b, st, side, alpha, beta)
         local isCapture = b[m.r][m.c] ~= " "
         local isPromo = m.promote
         if isCapture or isPromo then
-          local sim = {}
-          for k,v in pairs(m) do sim[k]=v end
-          if isPromo and not sim.promoPiece then sim.promoPiece = "Q" end
-          local nb, ns = applyMove(b, r, c, sim, st)
-          if not inCheck(nb, side) then
-            local score = -quiescence(nb, ns, opp(side), -beta, -alpha)
-            if score >= beta then return beta end
-            if score > alpha then alpha = score end
+          -- Skip obviously losing captures (SEE < 0)
+          if isCapture then
+            local see = SEE(b, r, c, m.r, m.c)
+            if see < 0 then
+              -- skip this losing capture
+            else
+              local sim = {}
+              for k,v in pairs(m) do sim[k]=v end
+              if isPromo and not sim.promoPiece then sim.promoPiece = "Q" end
+              local nb, ns = applyMove(b, r, c, sim, st)
+              if not inCheck(nb, side) then
+                local score = -quiescence(nb, ns, opp(side), -beta, -alpha)
+                if score >= beta then return beta end
+                if score > alpha then alpha = score end
+              end
+            end
+          else
+            -- promotions without capture
+            local sim = {}
+            for k,v in pairs(m) do sim[k]=v end
+            if isPromo and not sim.promoPiece then sim.promoPiece = "Q" end
+            local nb, ns = applyMove(b, r, c, sim, st)
+            if not inCheck(nb, side) then
+              local score = -quiescence(nb, ns, opp(side), -beta, -alpha)
+              if score >= beta then return beta end
+              if score > alpha then alpha = score end
+            end
           end
         end
       end
@@ -953,7 +1140,6 @@ local function search(b, st, side, depth, alpha, beta, ply, pvMove)
   end end
 
   if #moves == 0 then
-    -- checkmate or stalemate
     if inCheck(b, side) then
       return - (100000 - ply), nil -- mate distance scoring
     else
@@ -967,34 +1153,82 @@ local function search(b, st, side, depth, alpha, beta, ply, pvMove)
   local bestMove = nil
   local originalAlpha = alpha
 
-  for i,m in ipairs(moves) do
-    local sim = {}
-    for k,v in pairs(m) do sim[k]=v end
-    if m.promote and not sim.promoPiece then sim.promoPiece = "Q" end
-    local nb, ns = applyMove(b, m.fromR, m.fromC, sim, st)
+  -- Only enforce save-queen pass if NOT in check
+  local inCheckNow = inCheck(b, side)
+  local enforceSaveQueen = (not inCheckNow) and isQueenHanging(b, side)
 
-    local score = -search(nb, ns, opp(side), depth-1, -beta, -alpha, ply+1, nil)
-    if score > bestScore then
-      bestScore = score
-      bestMove = m
-      if score > alpha then
-        alpha = score
-        if alpha >= beta then
-          -- store killer
-          killers[ply] = killers[ply] or {}
-          local mk = moveKey(m)
-          killers[ply][2] = killers[ply][1]
-          killers[ply][1] = mk
+  local function try_moves(requireFix)
+    for i, m in ipairs(moves) do
+      repeat
+        local simulate = true
+
+        -- Hard guard: BIG pieces shouldn't make clearly losing captures
+        do
+          local moverUp = b[m.fromR][m.fromC]:upper()
+          if isBigPieceChar(moverUp) and b[m.r][m.c] ~= " " then
+            local seeCap = SEE(b, m.fromR, m.fromC, m.r, m.c)
+            if seeCap < 0 then simulate = false end
+          end
+        end
+        if not simulate then break end
+
+        -- Child
+        local sim = {}
+        for k,v in pairs(m) do sim[k] = v end
+        if m.promote and not sim.promoPiece then sim.promoPiece = "Q" end
+        local nb, ns = applyMove(b, m.fromR, m.fromC, sim, st)
+
+        -- If we just moved a BIG piece to a square where the opponent can profitably capture it,
+        -- skip unless it was a non-losing capture (SEE >= 0).
+        do
+          local moverUp = b[m.fromR][m.fromC]:upper()
+          if isBigPieceChar(moverUp) then
+            if opponentProfitsCapturing(nb, m.r, m.c, opp(side)) then
+              local wasCap = (b[m.r][m.c] ~= " ")
+              local okCap  = wasCap and (SEE(b, m.fromR, m.fromC, m.r, m.c) >= 0)
+              if not okCap then break end
+            end
+          end
+        end
+
+        -- Pass 1 may require we FIX a hanging queen; skip moves that don't fix it.
+        if requireFix and isQueenHanging(nb, side) then
           break
         end
-      end
+
+        -- Search child
+        local score = -search(nb, ns, opp(side), depth-1, -beta, -alpha, ply+1, nil)
+        if score > bestScore then
+          bestScore = score
+          bestMove = m
+          if score > alpha then
+            alpha = score
+            if alpha >= beta then
+              killers[ply] = killers[ply] or {}
+              local mk = moveKey(m)
+              killers[ply][2] = killers[ply][1]
+              killers[ply][1] = mk
+              break
+            end
+          end
+        end
+        if stopSearch then break end
+      until true
     end
-    if stopSearch then break end
+  end
+
+  -- Pass 1: if we can (not in check and queen hanging), only accept moves that fix it
+  if enforceSaveQueen then
+    try_moves(true)
+  end
+  -- Pass 2 fallback: if nothing found (or we were in check), allow all legal moves
+  if not bestMove then
+    try_moves(false)
   end
 
   -- store in TT
   local flag = 0
-  if bestScore <= originalAlpha then flag = 1   -- upper bound (beta cut for opponent)
+  if bestScore <= originalAlpha then flag = 1   -- upper bound
   elseif bestScore >= beta then flag = -1       -- lower bound
   end
   TT[key] = { depth = depth, score = bestScore, flag = flag, move = bestMove }
@@ -1017,24 +1251,19 @@ local function aiChooseMove(b, st, side, maxTimeMs, maxDepth)
     if move then bestMove = move; bestScore = score; lastPV = move end
     if isTimeUp() then break end
   end
-  -- print(("AI depth reached, nodes=%d, best=%.1f"):format(nodes, bestScore))
   return bestMove
 end
 
 function love.update(dt)
   if gameOver or promoting then return end
   if AI_ENABLED and turn == AI_SIDE then
-    -- compute synchronously; for longer times consider coroutine/yielding
     local move = aiChooseMove(board, state, AI_SIDE, AI_TIME_MS, AI_MAX_DEPTH)
     if move then
-      -- Promotions from search default to queen; works fine
       board, state = applyMove(board, move.fromR, move.fromC, move, state)
       turn = (turn=="white") and "black" or "white"
       updateStatus()
     else
-      -- no move (should be game over), but just in case:
       updateStatus()
     end
   end
 end
-
